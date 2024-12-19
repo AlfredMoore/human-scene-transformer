@@ -30,7 +30,7 @@ import tqdm
 
 _INPUT_PATH = flags.DEFINE_string(
     'input_path',
-    default=None,
+    default='/media/linuxmo/Shared/fluentrobotics',
     help='Path to jrdb2022 dataset.'
 )
 
