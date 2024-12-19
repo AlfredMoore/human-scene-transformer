@@ -21,7 +21,8 @@ import os
 
 from absl import app
 from absl import flags
-
+# Should add hst project path to PYTHONPATH
+# export PYTHONPATH=/media/linuxmo/Shared/fluentrobotics/human-scene-transformer:$PYTHONPATH
 from human_scene_transformer.data import box_utils
 from human_scene_transformer.data import utils
 import numpy as np
@@ -33,7 +34,7 @@ import tqdm
 
 _INPUT_PATH = flags.DEFINE_string(
     'input_path',
-    default=None,
+    default='/media/linuxmo/Shared/fluentrobotics',
     help='Path to jrdb2022 dataset.'
 )
 
@@ -54,8 +55,9 @@ def get_agents_3d_bounding_box_dict(input_path, scene):
   agents = {}
 
   for frame in scene_data['labels']:
-    ts = int(frame.split('.')[0])
-    for det in scene_data['labels'][frame]:
+    ts = int(frame.split('.')[0])       # 000000.pcb to 0
+    for det in scene_data['labels'][frame]:   # individual pedestrain dict
+      # we need 2d box cx and cy for agent position
       agents[(ts, det['label_id'])] = {
           'box': np.array([
               det['box']['cx'],
@@ -72,7 +74,7 @@ def get_agents_3d_bounding_box_dict(input_path, scene):
               det['box']['h'],
               det['box']['rot_z']])
           }
-  return agents
+  return agents   # agent: dict[(timestep, pedestrian_id) : dict['box', 'box3d']]
 
 
 def get_agents_3d_bounding_box_detections_dict(input_path, scene):
@@ -86,7 +88,7 @@ def get_agents_3d_bounding_box_detections_dict(input_path, scene):
   agents = []
 
   for frame in scene_data['detections']:
-    ts = int(frame.split('.')[0])
+    ts = int(frame.split('.')[0])   # 000000.pcb to 0
     for det in scene_data['detections'][frame]:
       agents.append((
           ts,
@@ -140,52 +142,55 @@ def jrdb_train_detections_to_tracks(input_path, output_path):
   scenes = utils.list_scenes(
       os.path.join(input_path, 'train_dataset'))
   for scene in tqdm.tqdm(scenes):
+    # agent from labelled data
     bb_dict = get_agents_3d_bounding_box_dict(
-        os.path.join(input_path, 'train_dataset'), scene)
+        os.path.join(input_path, 'train_dataset'), scene)   # dict[(timestep, pedestrian_id) : dict['box', 'box3d']]
     bb_3d_df = pd.DataFrame.from_dict(
         bb_dict, orient='index').rename_axis(['timestep', 'id'])  # pytype: disable=missing-parameter  # pandas-drop-duplicates-overloads
 
+    # agent from detection data
     bb_detections_list = get_agents_3d_bounding_box_detections_dict(
-        os.path.join(input_path, 'train_dataset'), scene)
+        os.path.join(input_path, 'train_dataset'), scene) # list[(timestep, box_array, box3d_array, score)]
     bb_3d_detections_df = pd.DataFrame(
-        bb_detections_list, columns=['timestep', 'box', 'box3d', 'score'])
+        bb_detections_list, columns=['timestep', 'box', 'box3d', 'score'])  # no pedestrain_id in detection data
 
     dfs = []
-    for ts, gt_group in bb_3d_df.groupby('timestep'):
+    for ts, gt_group in bb_3d_df.groupby('timestep'): # At each timestep
       detections_group = bb_3d_detections_df.loc[
-          (bb_3d_detections_df['timestep'] == ts)]
-      detection_boxes = np.vstack(detections_group['box'])
-      gt_boxes = np.vstack(gt_group['box'])
+          (bb_3d_detections_df['timestep'] == ts)]  # align detections timestamo to label timestamp
+      detection_boxes = np.vstack(detections_group['box'])  # [detected agent_num, box_size(5)]
+      gt_boxes = np.vstack(gt_group['box'])   # [ground true agent_num, box_size(5)]
 
       detection_boxes_rep = np.repeat(
-          detection_boxes, gt_boxes.shape[0], axis=0)
-      gt_boxes_til = np.tile(gt_boxes, (detection_boxes.shape[0], 1))
+          detection_boxes, gt_boxes.shape[0], axis=0) # [detected agent_num * ground true agent_num, box_size(5)]
+      gt_boxes_til = np.tile(gt_boxes, (detection_boxes.shape[0], 1)) # [detected agent_num * ground true agent_num, box_size(5)]
 
       iou = box_utils.compute_paired_bev_iou(
           tf.convert_to_tensor(detection_boxes_rep),
           tf.convert_to_tensor(gt_boxes_til)
-          )
+          )   # matching detection to ground true data
       assert isinstance(iou, tf.Tensor)
       iou_np = iou.numpy().reshape(
-          (detection_boxes.shape[0], gt_boxes.shape[0]))
+          (detection_boxes.shape[0], gt_boxes.shape[0]))    # [detected agent_num, ground true agent_num]
       cost = 1 - iou_np
-      r, c = scipy.optimize.linear_sum_assignment(cost.T)
+      r, c = scipy.optimize.linear_sum_assignment(cost.T)   # matching detection to ground true data by selecting lowest cost
 
-      unmatched_gt = np.argwhere(cost.T[r, c] == 1.)[..., 0]
+      unmatched_gt = np.argwhere(cost.T[r, c] == 1.)[..., 0]  # unmatched ground true data (cost = 1)
 
       df_tmp = gt_group.iloc[r].copy()
-      df_tmp['detection'] = detections_group['box3d'].iloc[c].to_list()
+      df_tmp['detection'] = detections_group['box3d'].iloc[c].to_list()   # copy matched detection data to ground true data
 
-      df_tmp = df_tmp.drop(index=df_tmp.index[unmatched_gt])
+      df_tmp = df_tmp.drop(index=df_tmp.index[unmatched_gt])  # drop unmatched ground true data
 
-      dfs.append(df_tmp)
+      dfs.append(df_tmp)  # append matched data at certain timestep to list
 
-    matched_df = pd.concat(dfs)
+    matched_df = pd.concat(dfs)   # timestep, pedestrian_id, box, box3d, detection3d
 
-    labels_dict = detections_to_dict(matched_df)
+    labels_dict = detections_to_dict(matched_df)  
 
     with open(f"{output_path}/{scene}.json", 'w') as write_file:
       json.dump(labels_dict, write_file, indent=2, ensure_ascii=True)
+  # Then you should have a detection dict containing box3d, matched with ground true data.
 
 
 def main(argv):
